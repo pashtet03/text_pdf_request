@@ -1,0 +1,185 @@
+import os
+from pdf2image import convert_from_path
+import easyocr
+import spacy
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+import numpy as np
+import torch
+import cv2
+from transformers import BartTokenizer, BartForConditionalGeneration
+
+def create_folder(folder_name):
+    """Создает папку, если она еще не существует."""
+    root_directory = os.getcwd()
+    folder_path = os.path.join(root_directory, folder_name)
+    if not os.path.exists(folder_path):
+        os.makedirs(folder_path)
+        print(f"Папка '{folder_name}' успешно создана в {root_directory}")
+    else:
+        print(f"Папка '{folder_name}' уже существует!")
+    return folder_path
+
+def process_page_with_borders(image):
+    """Находит текст между границами (полосами) и замазывает его."""
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    _, binary = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY_INV)
+    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    contours = sorted(contours, key=lambda c: cv2.boundingRect(c)[1])
+    stripes = []
+
+    for contour in contours:
+        x, y, w, h = cv2.boundingRect(contour)
+        aspect_ratio = w / h
+        if aspect_ratio > 5 and h < 15:  # Широкая и низкая
+            stripes.append((x, y, w, h))
+
+    for i in range(len(stripes) - 1):
+        x1, y1, w1, h1 = stripes[i]
+        x2, y2, w2, h2 = stripes[i + 1]
+        distance = y2 - (y1 + h1)
+        max_distance = 250
+
+        if distance > 0 and distance <= max_distance:
+            cv2.rectangle(image, (0, y1 + h1), (image.shape[1], y2), (255, 255, 255), -1)
+
+    return image
+
+
+def pdf_to_images(pdf_path, output_folder):
+    """Преобразует страницы PDF в изображения, замазывает их и сохраняет."""
+    images = convert_from_path(pdf_path)
+    total_pages = len(images)
+    os.makedirs(output_folder, exist_ok=True)
+    for i, image in enumerate(images):
+        page_number = str(i + 1).zfill(len(str(total_pages)))
+        image_np = np.array(image)
+        processed_image = process_page_with_borders(image_np)
+        output_path = os.path.join(output_folder, f'page_{page_number}.jpg')
+        cv2.imwrite(output_path, cv2.cvtColor(processed_image, cv2.COLOR_RGB2BGR))
+    print(f"Все страницы из '{pdf_path}' обработаны и сохранены в папке '{output_folder}'.")
+
+
+def extract_text_from_images(input_folder, output_file):
+    """Распознает текст на изображениях из указанной папки и сохраняет в файл."""
+    reader = easyocr.Reader(['en', 'ru'])
+    with open(output_file, 'w', encoding='utf-8') as f:
+        for filename in os.listdir(input_folder):
+            if filename.endswith('.jpg'):
+                file_path = os.path.join(input_folder, filename)
+                result = reader.readtext(file_path)
+                texts = [item[1] for item in result]
+                f.write(f"--- {filename} ---\n")
+                for text in texts:
+                    f.write(text + '\n')
+                f.write('\n')
+    print(f"Распознанный текст записан в файл '{output_file}'.")
+
+def remove_line_breaks(input_file, output_file):
+    """Удаляет переносы строк в тексте и сохраняет результат в новый файл."""
+    with open(input_file, "r", encoding="utf-8") as f:
+        text = f.read()
+    cleaned_text = " ".join(text.splitlines())
+    with open(output_file, "w", encoding="utf-8") as f:
+        f.write(cleaned_text)
+    print(f"Обработанный текст сохранен в '{output_file}'")
+
+def generate_summary(input_file, output_file):
+    """Генерирует резюме текста с использованием модели BART."""
+    # Укажите путь к локальной папке с моделью
+    local_model_path = './Summary'
+
+    # Загрузка модели и токенайзера из локальной папки
+    tokenizer = BartTokenizer.from_pretrained(local_model_path)
+    model = BartForConditionalGeneration.from_pretrained(local_model_path)
+
+    # Проверка на доступность GPU
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    model.to(device)
+
+    # Загрузка текста из файла
+    with open(input_file, 'r', encoding='utf-8') as file:
+        full_text = file.read()
+
+    # Функция разбиения текста на части
+    def split_text(text, max_tokens=512):
+        """Разбивает текст на части с учетом максимального числа токенов."""
+        words = text.split()
+        for i in range(0, len(words), max_tokens):
+            yield " ".join(words[i:i + max_tokens])
+
+    # Обработка текста
+    print("Обработка текста...")
+    summaries = []  # Для хранения частей итогового резюме
+    for part in split_text(full_text, max_tokens=512):  # Разделяем текст на части
+        input_text = f"Сократи текст: {part}"
+        input_ids = tokenizer.encode(input_text, return_tensors='pt', max_length=1024, truncation=True).to(device)
+
+        # Генерация результата
+        outputs = model.generate(
+            input_ids,
+            max_length=50,
+            min_length=10,
+            num_beams=20,
+            no_repeat_ngram_size=4,
+            top_p=0.9,
+            do_sample=True,
+            eos_token_id=tokenizer.eos_token_id
+        )
+        # Декодирование результата
+        summary = tokenizer.decode(outputs[0], skip_special_tokens=True)
+        summaries.append(summary)
+
+    # Объединяем части в итоговое резюме
+    final_summary = "\n".join(summaries)
+
+    # Сохранение результата в файл
+    with open(output_file, 'w', encoding='utf-8') as file:
+        file.write(final_summary)
+
+    print(f"Резюме сохранено в файл: {output_file}")
+
+def extract_relevant_sentences(input_file, query, output_file="relevant_sentences.txt", threshold=0.15):
+    """Извлекает предложения, релевантные запросу, на основе TF-IDF сходства."""
+    with open(input_file, "r", encoding="utf-8") as f:
+        text = f.read()
+    nlp = spacy.load("en_core_web_sm")
+    doc = nlp(text)
+    sentences = [sent.text.strip() for sent in doc.sents]
+    vectorizer = TfidfVectorizer()
+    tfidf_matrix = vectorizer.fit_transform(sentences + [query])
+    query_vector = tfidf_matrix[-1]
+    sentences_vectors = tfidf_matrix[:-1]
+    similarities = cosine_similarity(query_vector, sentences_vectors)[0]
+    relevant_sentences = [sentences[i] for i in range(len(sentences)) if similarities[i] >= threshold]
+    with open(output_file, "w", encoding="utf-8") as f:
+        for sentence in relevant_sentences:
+            f.write(sentence + "\n")
+    print(f"{len(relevant_sentences)} релевантных предложений сохранено в '{output_file}'")
+
+if __name__ == "__main__":
+    # 1. Создание папки для изображений
+    folder_name = "jpg"
+    folder_path = create_folder(folder_name)
+
+    # 2. Преобразование PDF в изображения
+    pdf_path = 'your_pdf_file.pdf'
+    pdf_to_images(pdf_path, folder_path)
+
+    # 3. Распознавание текста из изображений
+    output_text_file = 'output.txt'
+    extract_text_from_images(folder_path, output_text_file)
+
+    # 4. Удаление переносов строк
+    cleaned_text_file = 'cleaned_output.txt'
+    remove_line_breaks(output_text_file, cleaned_text_file)
+
+    # 6. Извлечение релевантных предложений
+    query = "YOUR REQUEST"
+    threshold = 0.15
+    relevant_sentences_file = 'relevant_sentences.txt'
+    extract_relevant_sentences(cleaned_text_file, query, relevant_sentences_file, threshold)
+
+    # 5. Генерация резюме текста
+    summary_file = 'summary.txt'
+    generate_summary(relevant_sentences_file, summary_file)
